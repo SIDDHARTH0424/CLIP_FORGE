@@ -39,6 +39,10 @@ MAX_SOURCE_BYTES = int(float(os.environ.get("WORKER_MAX_SOURCE_GB", "20") or 20)
 _stop = threading.Event()
 
 
+class Stopping(Exception):
+    """This worker is being stopped: the job goes back, it did not fail."""
+
+
 class Gone(Exception):
     """The API says the job is no longer ours: drop it."""
 
@@ -223,7 +227,8 @@ def run_job(job_id, claim):
         log(f"{job_id}: rendering ({os.path.getsize(source) >> 20} MB source)")
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                 env=job_env(info.get("env")), cwd=os.getcwd(),
-                                preexec_fn=(lambda: os.nice(NICE)) if NICE else None)
+                                preexec_fn=(lambda: os.nice(NICE)) if NICE else None,
+                                start_new_session=True)
         uploader = Uploader(job_id, claim, out_dir, skip=[source])
         pending, lock = [], threading.Lock()
 
@@ -268,7 +273,7 @@ def run_job(job_id, claim):
 
         while proc.poll() is None:
             if _stop.is_set():
-                raise RuntimeError("worker stopping")
+                raise Stopping("worker stopping")
             flush()                          # also the heartbeat
             time.sleep(3)
         t.join(30)
@@ -287,12 +292,21 @@ def run_job(job_id, claim):
             _call("POST", f"/internal/worker/jobs/{job_id}/log", claim, tries=1,
                   json={"lines": [f"Execution error: remote worker failed ({type(e).__name__}) (killed)."]})
             _call("POST", f"/internal/worker/jobs/{job_id}/done", claim, tries=1,
-                  json={"returncode": -15})
+                  json={"returncode": -15,
+                        "stopping": isinstance(e, Stopping) or _stop.is_set()})
         except Exception:
             pass
     finally:
         if proc is not None and proc.poll() is None:
-            proc.kill()
+            try:
+                os.killpg(proc.pid, signal.SIGTERM)
+                deadline = time.monotonic() + 5
+                while proc.poll() is None and time.monotonic() < deadline:
+                    time.sleep(0.1)
+                if proc.poll() is None:
+                    os.killpg(proc.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
         shutil.rmtree(out_dir, ignore_errors=True)
         if source and os.path.exists(source):
             try:

@@ -81,9 +81,13 @@ TIME CONTRACT — STRICT:
   shorter than {min_secs:g}s, return one clip spanning the full video.
 - Cut on visual scene changes, never mid-motion.
 
-For each clip write catchy copy in {language} (a scroll-stopping hook, a TikTok
-and an Instagram description, and a YouTube title ≤100 chars). Order clips best
-to worst by how likely they are to stop a viewer scrolling.
+For each clip, write catchy copy using these language rules:
+- If {language} is Hindi, write natural Hinglish in LATIN/ROMAN letters only. Do NOT use Devanagari.
+- If {language} is English, write natural standard English.
+- For other languages, use that language's normal writing system.
+Write a scroll-stopping hook, a TikTok description, an Instagram description,
+and a YouTube title ≤100 chars. Order clips best to worst by how likely they
+are to stop a viewer scrolling.
 """
 
 
@@ -100,6 +104,11 @@ GROUNDED_HOOK_PROMPT = """
 These frames come from ONE short clip (the whole clip, in order) and the
 transcript below is exactly what is said during it. Most of this clip's
 meaning is on the screen, not in the face.
+
+COPY LANGUAGE:
+- If TRANSCRIPT_LANGUAGE is Hindi, write `viral_hook_text` and `video_title_for_youtube_short` in natural Hinglish using LATIN/ROMAN letters only. Do NOT use Devanagari.
+- If TRANSCRIPT_LANGUAGE is English, use natural standard English.
+- For other languages, use that language's normal writing system.
 
 1. `on_screen`: one line naming what is shown — the app, window, product,
    document, code, chart or on-screen text — as specifically as the frames
@@ -340,13 +349,12 @@ HOOK PLAYBOOK — pick the strongest fitting pattern for `viral_hook_text` (max 
   video ("I automated my clips with AI") is wrong. If nothing concrete can be
   named, quote the clip's strongest sentence instead of summarising the topic.
 
-COPY RULES — ALL text fields (descriptions, title, hook) MUST be written in TRANSCRIPT_LANGUAGE ({language}):
-- Descriptions (TikTok + Instagram): 1-2 punchy sentences that tease the payoff
-  without spoiling it, then 3-5 topically relevant hashtags. No generic hashtag spam.
-- `video_title_for_youtube_short`: max 100 chars, curiosity-driven, no fake claims.
-- `predicted_score`: honest 0-100 estimate of viral potential.
-- `why`: one sentence, max 20 words, naming what makes THIS moment worth a
-  clip — the specific hook, claim, number or payoff, not the topic.
+COPY LANGUAGE RULES:
+- If TRANSCRIPT_LANGUAGE is Hindi (including Hindi-dominant speech), write all generated titles and descriptions in natural Hinglish using LATIN/ROMAN letters only. Do NOT use Devanagari. Use common English words naturally, as in everyday Indian social-media speech. Do not turn the entire copy into pure English.
+- If TRANSCRIPT_LANGUAGE is English, write in natural standard English.
+- For other transcript languages, continue using that language's normal writing system.
+- Apply this to TikTok and Instagram descriptions, hashtags where natural, YouTube title, and hook.
+- Keep all existing requirements for description length, hashtag count, uniqueness, and title length.
 
 TRANSCRIPT_LANGUAGE: {language}
 VIDEO_DURATION_SECONDS: {video_duration}

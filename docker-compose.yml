@@ -1,14 +1,30 @@
+
 services:
   backend:
-    build: .
+    build:
+      context: .
+      args:
+        GPU: "1"
     container_name: openshorts-backend
+    gpus: all
     ports:
       - "8000:8000"
     volumes:
       - .:/app
       - /app/__pycache__
       - ./output:/app/output
+      - ./models:/models
+    environment:
+      - YOLO_MODEL_PATH=/models/yolov8n.pt
+      - YOLO_CONFIG_DIR=/tmp/ultralytics
+      - MPLCONFIGDIR=/tmp/matplotlib
+      - XDG_CACHE_HOME=/tmp/.cache
+      - WHISPER_DEVICE=cuda
+      - WHISPER_COMPUTE=float16
+      - TRANSCRIBE_BACKEND=whisper
+      - AUTO_HOOK=${AUTO_HOOK:-0}
     restart: unless-stopped
+
 
   frontend:
     build:
@@ -25,6 +41,7 @@ services:
       - backend
 
   renderer:
+    gpus: all
     build:
       context: .
       dockerfile: render-service/Dockerfile
@@ -37,6 +54,7 @@ services:
       - REMOTION_BUNDLE_PATH=/app/remotion
       - OUTPUT_DIR=/output
       - PORT=3100
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility,video
     restart: unless-stopped
     depends_on:
       - backend

@@ -49,7 +49,8 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 # Configuration
 # Default to 1 if not set, but user can set higher for powerful servers
 MAX_CONCURRENT_JOBS = int(os.environ.get("MAX_CONCURRENT_JOBS", "5"))
-MAX_FILE_SIZE_MB = 2048  # 2GB limit
+MAX_FILE_SIZE_MB = int(os.environ.get("MAX_FILE_SIZE_MB", "10240"))  # 10GB source limit
+MAX_THUMBNAIL_FILE_SIZE_MB = int(os.environ.get("MAX_THUMBNAIL_FILE_SIZE_MB", "2048"))
 
 # How TikTok receives our uploads. MEDIA_UPLOAD lands the video in the user's
 # TikTok drafts so they finish the post inside TikTok's own editor; DIRECT_POST
@@ -1731,6 +1732,7 @@ def _words_transcript(words, language="en"):
     words = sorted(words, key=lambda w: w["start"])
     return {
         "language": language,
+        "_preserve_word_text": True,
         "segments": [{
             "start": words[0]["start"], "end": max(w["end"] for w in words),
             "text": " ".join(w["word"] for w in words),
@@ -1920,6 +1922,8 @@ _stopping = False                    # SIGTERM received: report not-ready so the
                                      # proxy stops routing here before the
                                      # listening socket closes
 _running_jobs: set = set()           # job ids with a live subprocess here
+_cancel_requested_jobs: set = set() # explicit user cancellations; never auto-retry
+_job_processes: Dict[str, Any] = {}   # local main.py process groups by job id
 
 
 # --- Remote CPU worker (remote_worker.py, worker.py) -------------------------
@@ -2117,7 +2121,7 @@ def gpu_has_room(running_here: int, busy_elsewhere: int, free_mb) -> bool:
     return free_mb >= GPU_MIN_FREE_MB
 
 
-async def _wait_for_shared_gpu():
+async def _wait_for_shared_gpu(job_id=None):
     """Hold a new job until the GPU has room for it: this instance's jobs
     plus the ones another instance is still draining must fit
     MAX_CONCURRENT_JOBS, and the card must have GPU_MIN_FREE_MB free.
@@ -2128,11 +2132,13 @@ async def _wait_for_shared_gpu():
     logged = False
     loop = asyncio.get_event_loop()
     while waited < SHARED_GPU_MAX_WAIT:
+        if job_id in _cancel_requested_jobs:
+            return False
         # Reads every manifest on the shared disk: off the loop.
         elsewhere = await loop.run_in_executor(None, _jobs_busy_elsewhere)
         free_mb = await loop.run_in_executor(None, _gpu_free_mb)
         if gpu_has_room(_local_running(), elsewhere, free_mb):
-            return
+            return True
         if not logged:
             print(f"⏳ Holding the next job: {_local_running()} running here, "
                   f"{elsewhere} on a draining instance, "
@@ -2141,6 +2147,7 @@ async def _wait_for_shared_gpu():
             logged = True
         await asyncio.sleep(SHARED_GPU_WAIT_SECONDS)
         waited += SHARED_GPU_WAIT_SECONDS
+    return job_id not in _cancel_requested_jobs
 
 
 def _write_instance_marker():
@@ -2379,6 +2386,25 @@ def _resume_candidates(held: set, now: float):
     return keep_reservations, picked
 
 
+# Free-plan jobs render at up to FREE_MAX_FPS (0 = source rate): the cut that
+# every later pass reads is made at that rate (ffmpeg_utils.cut_rate_filter),
+# so a 60 fps source costs about half the decoder and encoder time. Paid plans
+# keep the source's rate.
+def _free_max_fps() -> int:
+    try:
+        return max(0, int(os.environ.get("FREE_MAX_FPS", "30")))
+    except ValueError:
+        return 30
+
+
+def _apply_rate_cap(env) -> None:
+    cap = _free_max_fps() if env.get("WATERMARK") == "1" else 0
+    if cap:
+        env["CUT_MAX_FPS"] = str(cap)
+    else:
+        env.pop("CUT_MAX_FPS", None)
+
+
 def _register_resumed(picked) -> int:
     """Loop part of the resume scan: a record and a heap entry per picked
     manifest. The heap orders them by submission time, whatever order the
@@ -2409,6 +2435,7 @@ def _register_resumed(picked) -> int:
             env["WATERMARK"] = "1"
         else:
             env.pop("WATERMARK", None)
+        _apply_rate_cap(env)
         partial = m.get("partial")
         _apply_source_cut(env, partial)
         if m.get("source_cap_minutes"):
@@ -2823,6 +2850,28 @@ def _upload_job_id(filename: str) -> str:
     return filename.split("_", 1)[0]
 
 
+def _output_jobs_size() -> int:
+    """Bytes under OUTPUT_DIR that the size cap can free: the job dirs (and
+    loose files), not the dot entries. Those are never purged by it, and one
+    of them is the download cache (``.source_cache``, source_cache.py) with a
+    cap of its own: counting it here would purge finished jobs to make room
+    for files this cap may not delete."""
+    total = 0
+    try:
+        names = os.listdir(OUTPUT_DIR)
+    except OSError:
+        return 0
+    for name in names:
+        if _not_a_job_dir(name):
+            continue
+        path = os.path.join(OUTPUT_DIR, name)
+        try:
+            total += _dir_size(path) if os.path.isdir(path) else os.path.getsize(path)
+        except OSError:
+            pass
+    return total
+
+
 def _not_a_job_dir(name) -> bool:
     """Dot entries of OUTPUT_DIR are the instances' shared state, never a job:
     the country database (``.geoip/``), the queue watch and mode files, the
@@ -2902,7 +2951,7 @@ def _enforce_output_size_cap():
     cap = OUTPUT_MAX_GB * 1024 ** 3
     if cap <= 0:
         return
-    used = _dir_size(OUTPUT_DIR)
+    used = _output_jobs_size()
     if used <= cap:
         return
     thumbs = os.path.basename(THUMBNAILS_DIR)
@@ -3044,24 +3093,61 @@ async def process_queue():
             _priority, _seq, job_id = await job_queue.get()
             _queue_changed()
 
+            if job_id in _cancel_requested_jobs or (jobs.get(job_id) or {}).get('status') != 'queued':
+                _admitting.discard(job_id)
+                job_queue.task_done()
+                job = jobs.get(job_id)
+                if job and job.get('status') == 'cancelled':
+                    _begin_delivery(job_id, job)
+                    asyncio.create_task(_deliver_job(job_id, job))
+                continue
+
             if _draining:
                 # Leave it on disk for the next instance (manifest, no heartbeat).
                 print(f"⏸️ Draining — leaving {job_id} for the next instance.")
                 job_queue.task_done()
                 continue
 
-            # Acquire semaphore slot (waits if max jobs are running)
+            # Acquire semaphore slot (waits if max jobs are running). Poll so a
+            # user cancellation does not wait behind a long-running GPU job.
             _admitting.add(job_id)
-            await concurrency_semaphore.acquire()
-            if _draining:
+            acquired = False
+            while not acquired:
+                if job_id in _cancel_requested_jobs:
+                    break
+                try:
+                    await asyncio.wait_for(concurrency_semaphore.acquire(), timeout=0.5)
+                    acquired = True
+                except asyncio.TimeoutError:
+                    if _draining:
+                        break
+            if not acquired:
+                _admitting.discard(job_id)
+                job_queue.task_done()
+                job = jobs.get(job_id)
+                if job and job.get('status') == 'cancelled':
+                    _begin_delivery(job_id, job)
+                    asyncio.create_task(_deliver_job(job_id, job))
+                if _draining:
+                    print(f"⏸️ Draining — leaving {job_id} for the next instance.")
+                continue
+            if _draining and job_id not in _cancel_requested_jobs:
                 _admitting.discard(job_id)
                 concurrency_semaphore.release()
                 job_queue.task_done()
                 print(f"⏸️ Draining — leaving {job_id} for the next instance.")
                 continue
             # The old container may still be draining its jobs on this GPU.
-            await _wait_for_shared_gpu()
+            await _wait_for_shared_gpu(job_id)
             _admitting.discard(job_id)
+            if job_id in _cancel_requested_jobs:
+                concurrency_semaphore.release()
+                job_queue.task_done()
+                job = jobs.get(job_id)
+                if job and job.get('status') == 'cancelled':
+                    _begin_delivery(job_id, job)
+                    asyncio.create_task(_deliver_job(job_id, job))
+                continue
             if _draining:
                 concurrency_semaphore.release()
                 job_queue.task_done()
@@ -3181,7 +3267,7 @@ async def run_job_wrapper(job_id):
     except Exception as e:
          print(f"❌ Job wrapper error {job_id}: {e}")
     finally:
-        if interrupted or (_stopping and job and job.get('status') != 'completed'):
+        if interrupted or (_stopping and job and job.get('status') not in ('completed', 'cancelled')):
             _release_slot(job_id)
             print(f"♻️ Server stopping: leaving {job_id} for the next instance.")
             if interrupted:
@@ -3269,7 +3355,7 @@ def _stamp_delivery(job_id, job, done):
     if m is None:
         return
     m["stage"] = _DELIVERY_STAGE
-    m["outcome"] = job.get('status') if job.get('status') in ('completed', 'failed') else 'failed'
+    m["outcome"] = job.get('status') if job.get('status') in ('completed', 'failed', 'cancelled') else 'failed'
     m["ready_files"] = {str(k): v for k, v in (job.get('ready_files') or {}).items()}
     if m["outcome"] != 'completed':
         m["error"] = _job_error_text(list(job.get('logs') or []))[-500:]
@@ -3328,6 +3414,7 @@ async def _deliver_job(job_id, job):
         if not cancelled:
             _clear_resume_manifest(job_id)
             job.pop('delivering', None)
+            _cancel_requested_jobs.discard(job_id)
         _delivering_jobs.discard(job_id)
 
 
@@ -3358,7 +3445,7 @@ def _resume_delivery_record(job_id, job, m):
             pass
     job['delivered'] = list(m.get("delivered") or [])
     job['delivering'] = True
-    status = m.get("outcome") if m.get("outcome") in ('completed', 'failed') else 'failed'
+    status = m.get("outcome") if m.get("outcome") in ('completed', 'failed', 'cancelled') else 'failed'
     if status == 'completed':
         try:
             job['result'] = _result_from_disk(job_id, job['output_dir'])
@@ -3417,7 +3504,8 @@ def is_transient_failure(logs) -> bool:
 def _should_auto_retry(job) -> bool:
     # A run on the remote worker that did not complete is always run again
     # here, whatever it printed: this host decides what a video's failure is.
-    if not (job and job.get('status') == 'failed' and not _draining and job.get('cmd')):
+    if not (job and job.get('status') == 'failed' and not job.get('cancel_requested')
+            and not _draining and job.get('cmd')):
         return False
     # YouTube limiting the account is neither the video's fault nor a server
     # fault: the job waits out the cooldown, a few times at most, on its own
@@ -3808,8 +3896,9 @@ async def _notify_job_webhook(job_id):
         return
     job['webhook_sent'] = True
     completed = job.get('status') == 'completed'
+    cancelled = job.get('status') == 'cancelled'
     payload = {
-        "event": "job.completed" if completed else "job.failed",
+        "event": "job.completed" if completed else ("job.cancelled" if cancelled else "job.failed"),
         "job_id": job_id,
         "status": job.get('status'),
         "clips": (await _webhook_clip_entries(job_id, job)) if completed else [],
@@ -4727,9 +4816,8 @@ def _finish_job(job_id, returncode, output_dir):
 async def _run_main(job_id, cmd, env, tick=None):
     """Run a main.py command of ``job_id`` to its end and return its exit
     code: output lines into the job's log, the manifest heartbeated, ``tick``
-    called every couple of seconds. Cancelled (the server is stopping): the
-    child is killed so it cannot keep writing into the job dir while the next
-    instance resumes the same job."""
+    called every couple of seconds. Each child gets its own process group so
+    explicit cancellation can stop main.py and its ffmpeg/yt-dlp descendants."""
     process = subprocess.Popen(
         cmd,
         stdout=subprocess.PIPE,
@@ -4737,35 +4825,58 @@ async def _run_main(job_id, cmd, env, tick=None):
         env=env,
         cwd=os.getcwd(),
         preexec_fn=_lower_priority,
+        start_new_session=True,
     )
+    _job_processes[job_id] = process
     # We need to capture logs in a thread because Popen isn't async
     t_log = threading.Thread(target=enqueue_output, args=(process.stdout, job_id))
     t_log.daemon = True
     t_log.start()
 
     last_heartbeat = time.time()
-    while process.poll() is None:
-        try:
-            await asyncio.sleep(2)
-        except asyncio.CancelledError:
+    try:
+        while process.poll() is None:
             try:
-                process.kill()
-            except Exception:
-                pass
-            raise
-        if time.time() - last_heartbeat >= HEARTBEAT_EVERY:
-            _touch_manifest(job_id)
-            last_heartbeat = time.time()
-        if tick is not None:
-            tick()
-    # The exit code can be read before the reader thread saw the last lines
-    # (SOURCE_READY is printed right before the exit).
-    await asyncio.to_thread(t_log.join, 5)
-    return process.returncode
+                await asyncio.sleep(2)
+            except asyncio.CancelledError:
+                with suppress(ProcessLookupError):
+                    os.killpg(process.pid, signal.SIGTERM)
+                raise
+            if job_id in _cancel_requested_jobs and process.poll() is None:
+                # Each job owns a session/process group, so ffmpeg/yt-dlp and
+                # their descendants stop with main.py rather than surviving it.
+                with suppress(ProcessLookupError):
+                    os.killpg(process.pid, signal.SIGTERM)
+                deadline = time.monotonic() + 5
+                while process.poll() is None and time.monotonic() < deadline:
+                    await asyncio.sleep(0.2)
+                if process.poll() is None:
+                    with suppress(ProcessLookupError):
+                        os.killpg(process.pid, signal.SIGKILL)
+                break
+            if time.time() - last_heartbeat >= HEARTBEAT_EVERY:
+                _touch_manifest(job_id)
+                last_heartbeat = time.time()
+            if tick is not None:
+                tick()
+        # The exit code can be read before the reader thread saw the last lines
+        # (SOURCE_READY is printed right before the exit).
+        await asyncio.to_thread(t_log.join, 5)
+        return process.returncode
+    finally:
+        if _job_processes.get(job_id) is process:
+            _job_processes.pop(job_id, None)
 
 
 async def run_job(job_id, job_data):
     """Executes the subprocess for a specific job."""
+    if job_id in _cancel_requested_jobs:
+        job_data['status'] = 'cancelled'
+        job_data['logs'].append("Cancelled by user.")
+        if job_id in _remote_jobs:
+            remote_worker.clear(job_data.get('output_dir') or os.path.join(OUTPUT_DIR, job_id),
+                                purge=True)
+        return
     if job_id in _remote_jobs:
         return await _run_job_remote(job_id, job_data)
 
@@ -4783,8 +4894,16 @@ async def run_job(job_id, job_data):
     try:
         returncode = await _run_main(
             job_id, cmd, env, tick=lambda: _refresh_partial_result(job_id, output_dir))
-        _finish_job(job_id, returncode, output_dir)
+        if job_id in _cancel_requested_jobs:
+            job_data['status'] = 'cancelled'
+            job_data['logs'].append("Cancelled by user.")
+        else:
+            _finish_job(job_id, returncode, output_dir)
     except Exception as e:
+        if job_id in _cancel_requested_jobs:
+            job_data['status'] = 'cancelled'
+            job_data['logs'].append("Cancelled by user.")
+            return
         jobs[job_id]['status'] = 'failed'
         # Exception text can embed URLs with credentials (e.g. the proxy URL
         # inside a yt-dlp/httpx error) — scrub before it reaches client logs.
@@ -4886,6 +5005,7 @@ async def _run_job_remote(job_id, job_data):
     jobs[job_id]['status'] = 'processing'
     jobs[job_id]['logs'].append("Job started by worker.")
     handed = False               # the worker was given the job (not just a claim)
+    worker_stopped = False       # ...and gave it back because it is restarting
     log_mark = len(job_data['logs'])
     try:
         parsed = remote_worker.worker_args(cmd)
@@ -4894,6 +5014,10 @@ async def _run_job_remote(job_id, job_data):
             env.pop("PROXY_URL", None)
         jobs[job_id].pop('remote_source', None)
         returncode = await _run_main(job_id, cmd + ["--prepare-only"], env)
+        if job_id in _cancel_requested_jobs:
+            job_data['status'] = 'cancelled'
+            job_data['logs'].append("Cancelled by user.")
+            return
         source = jobs[job_id].get('remote_source')
         if returncode != 0 or not source or parsed is None:
             _finish_job(job_id, returncode or 1, output_dir)
@@ -4921,6 +5045,10 @@ async def _run_job_remote(job_id, job_data):
         returncode = None
         while returncode is None:
             await asyncio.sleep(2)
+            if job_id in _cancel_requested_jobs:
+                job_data['status'] = 'cancelled'
+                job_data['logs'].append("Cancelled by user.")
+                return
             if time.time() - last_heartbeat >= HEARTBEAT_EVERY:
                 _touch_manifest(job_id)
                 last_heartbeat = time.time()
@@ -4931,6 +5059,7 @@ async def _run_job_remote(job_id, job_data):
             _refresh_partial_result(job_id, output_dir)
             if done is not None:
                 returncode = done
+                worker_stopped = remote_worker.read_stopping(output_dir)
             elif not remote_worker.is_remote(output_dir):
                 returncode = -15            # the claim was dropped under us
             elif (time.time() - remote_worker.last_seen(output_dir) > REMOTE_LEASE_SECONDS
@@ -4949,18 +5078,26 @@ async def _run_job_remote(job_id, job_data):
         jobs[job_id]['status'] = 'failed'
         jobs[job_id]['logs'].append(_scrub_secrets(f"Execution error: {str(e)}"))
     finally:
+        user_cancelled = job_id in _cancel_requested_jobs
+        if user_cancelled and job_data.get('status') != 'completed':
+            job_data['status'] = 'cancelled'
+            if not job_data['logs'] or job_data['logs'][-1] != "Cancelled by user.":
+                job_data['logs'].append("Cancelled by user.")
         # Whatever happened, the worker's claim ends here, and unless the job
         # completed so does everything the worker uploaded: the retry on this
         # host starts from this host's files. On a cancel (the server is
         # stopping) it all stays: the next instance clears it on resume.
         ok = job_data.get('status') == 'completed'
-        if ok or not _stopping:
+        if ok or not _stopping or user_cancelled:
             # A job that completed is done with its worker even while this
             # instance is being stopped: no claim may outlive the job.
-            remote_worker.clear(output_dir, purge=not ok)
-            if handed:
+            remote_worker.clear(output_dir, purge=(not ok or user_cancelled))
+            # A worker being restarted hands its jobs back: they run again and
+            # say nothing about the worker, so they do not trip the breaker
+            # (a restart used to park the worker for its full 30 minutes).
+            if handed and not worker_stopped and not user_cancelled:
                 _remote_outcome(ok)
-            if not ok:
+            if not ok and not user_cancelled:
                 # What the worker printed is not this host's diagnosis: the
                 # run that follows here writes the log the user, the retry
                 # rules and the alerts read.
@@ -5175,10 +5312,12 @@ async def worker_done(job_id: str, request: Request):
     if data.get("state") != remote_worker.READY:
         raise HTTPException(status_code=409, detail="The job is not rendering yet.")
     try:
-        returncode = int((await _worker_body(request))["returncode"])
+        body = await _worker_body(request)
+        returncode = int(body["returncode"])
     except Exception:
         raise HTTPException(status_code=400, detail="returncode required")
-    remote_worker.mark_done(job_dir, returncode)
+    stopping = returncode != 0 and body.get("stopping") is True
+    remote_worker.mark_done(job_dir, returncode, stopping=stopping)
     return {"ok": True}
 
 
@@ -5716,15 +5855,10 @@ async def process_endpoint(
     if chosen:
         print(f"[layouts] job={job_id} enabled={sorted(chosen)}")
 
-    # Auto-hook: burn each clip's Gemini hook text during the render. Off when
-    # the field is absent, so API/MCP/webhook callers keep their old output
-    # byte-for-byte; the dashboard sends an explicit value either way.
-    if str(auto_hook).lower() in ("1", "true", "yes"):
-        env["AUTO_HOOK"] = "1"
-        from hooks import HOOK_STYLES
-        if auto_hook_style in HOOK_STYLES:
-            env["AUTO_HOOK_STYLE"] = auto_hook_style
-        print(f"[auto-hook] job={job_id} style={env.get('AUTO_HOOK_STYLE', 'classic')}")
+    # Automatic hook overlays are disabled for newly generated clips.
+    # The manual Hook Editor remains available in the dashboard.
+    env["AUTO_HOOK"] = "0"
+    env.pop("AUTO_HOOK_STYLE", None)
 
     # Manual generation controls (discussion #65): optional clip-count target
     # and duration band, forwarded to the selection prompts via the same env
@@ -5899,6 +6033,7 @@ async def process_endpoint(
         # Free-plan clips carry a burned-in watermark (applied by the main.py
         # subprocess after each clip renders).
         env["WATERMARK"] = "1"
+    _apply_rate_cap(env)
 
     # Absolute-URL base for the webhook payload: explicit env wins (the API may
     # sit behind a proxy whose forwarded headers we can't trust), else what the
@@ -6036,6 +6171,44 @@ def _presented_status(job_id, job):
         # finished for the user until the delivery says so.
         return 'processing'
     return job['status']
+
+
+@app.post("/api/jobs/cancel-all")
+async def cancel_all_jobs(request: Request):
+    """Cancel every queued or running OpenShorts job owned by this caller.
+
+    Self-hosted instances have one operator, so all in-memory jobs are in scope.
+    Managed mode is tenant-scoped: never cancel another user's jobs.
+    """
+    owner_id = await _owner_id_from_request(request) if BILLING_ENABLED else None
+    if BILLING_ENABLED and owner_id is None:
+        raise HTTPException(status_code=401, detail="Authentication required")
+
+    queued = running = 0
+    for job_id, job in list(jobs.items()):
+        if not isinstance(job, dict):
+            continue
+        if BILLING_ENABLED and str(job.get("user_id") or "") != str(owner_id):
+            continue
+        state = job.get("status")
+        if state not in ("queued", "processing"):
+            continue
+        job["cancel_requested"] = True
+        _cancel_requested_jobs.add(job_id)
+        if state == "queued":
+            job["status"] = "cancelled"
+            job["logs"].append("Cancellation requested.")
+            queued += 1
+        else:
+            job["logs"].append("Stopping this job…")
+            running += 1
+
+    return {
+        "ok": True,
+        "queued_cancelled": queued,
+        "running_stopping": running,
+        "total": queued + running,
+    }
 
 
 @app.get("/api/status/{job_id}")
@@ -6216,8 +6389,9 @@ async def download_all_clips(job_id: str, request: Request):
         filename = (os.path.basename(url.split('/')[-1]) if url
                     else _canonical_clip_file(output_dir, base_name, i))
         path = os.path.join(output_dir, filename)
+        title = clip.get('video_title_for_youtube_short') or clip.get('title')
         if filename and os.path.exists(path):
-            files.append((i, path))
+            files.append((i, path, title))
 
     if not files:
         raise HTTPException(status_code=404, detail="No clip files found for this job")
@@ -6230,8 +6404,22 @@ async def download_all_clips(job_id: str, request: Request):
     def build_zip():
         # Videos are already compressed; store instead of deflate for speed.
         with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_STORED) as zf:
-            for i, path in files:
-                zf.write(path, arcname=f"clip_{i + 1:02d}_{os.path.basename(path)}")
+            used_names = set()
+            for i, path, title in files:
+                fallback = f"clip-{i + 1}"
+                stem = str(title or fallback).strip()
+                stem = re.sub(r'[<>:"/\\|?*\x00-\x1f]', ' ', stem)
+                stem = re.sub(r'\s+', ' ', stem).strip(' .')
+                stem = stem[:150].rstrip(' .') or fallback
+
+                arcname = f"{stem}.mp4"
+                suffix = 2
+                while arcname.casefold() in used_names:
+                    arcname = f"{stem} ({suffix}).mp4"
+                    suffix += 1
+
+                used_names.add(arcname.casefold())
+                zf.write(path, arcname=arcname)
 
     def remove_zip():
         with suppress(FileNotFoundError):
@@ -8862,14 +9050,14 @@ async def _save_thumbnail_upload(file, session_id):
     safe_name = _clamp_upload_name(os.path.basename(file.filename or "upload") or "upload")
     video_path = os.path.join(UPLOAD_DIR, f"thumb_{session_id}_{safe_name}")
     size = 0
-    limit_bytes = MAX_FILE_SIZE_MB * 1024 * 1024
+    limit_bytes = MAX_THUMBNAIL_FILE_SIZE_MB * 1024 * 1024
     with open(video_path, "wb") as buffer:
         while chunk := await file.read(1024 * 1024):
             size += len(chunk)
             if size > limit_bytes:
                 buffer.close()
                 os.remove(video_path)
-                raise HTTPException(status_code=413, detail=f"File too large. Max size {MAX_FILE_SIZE_MB}MB")
+                raise HTTPException(status_code=413, detail=f"File too large. Max size {MAX_THUMBNAIL_FILE_SIZE_MB}MB")
             buffer.write(chunk)
     if not BILLING_ENABLED:
         return video_path, None

@@ -63,7 +63,8 @@ _IMAGE_FILE_BYTES = 32 * 1024 * 1024
 # never do. The worker has its own model key and needs no proxy, cookie or
 # storage secret: this host downloads the source and delivers the result.
 _OPTION_NAMES = frozenset({
-    "WATERMARK", "MAX_SOURCE_MINUTES", "SOURCE_CAP_MINUTES", "HOOK_LAZY"})
+    "WATERMARK", "MAX_SOURCE_MINUTES", "SOURCE_CAP_MINUTES", "HOOK_LAZY",
+    "CUT_MAX_FPS"})
 _OPTION_PREFIXES = ("AUTO_", "CLIP_")
 _OPTION_VALUE = re.compile(r"^[A-Za-z0-9 _.,:+-]{0,120}$")
 _FORMATS = frozenset({"auto", "vertical", "horizontal", "square"})
@@ -343,9 +344,21 @@ def read_log(job_dir, offset):
     return [line for line in lines if line], offset + end + 1
 
 
-def mark_done(job_dir, returncode):
-    write_json_atomic(os.path.join(job_dir, DONE_FILE), {"returncode": int(returncode)})
+def mark_done(job_dir, returncode, stopping=False):
+    """``stopping``: the worker ended the job because it is being stopped or
+    restarted, not because the job failed. Such a job runs again and does not
+    count against the worker (``app._remote_outcome``)."""
+    write_json_atomic(os.path.join(job_dir, DONE_FILE),
+                      {"returncode": int(returncode), "stopping": bool(stopping)})
     touch_seen(job_dir)
+
+
+def read_stopping(job_dir) -> bool:
+    try:
+        with open(os.path.join(job_dir, DONE_FILE)) as f:
+            return json.load(f).get("stopping") is True
+    except (OSError, ValueError, AttributeError, TypeError):
+        return False
 
 
 def read_done(job_dir):

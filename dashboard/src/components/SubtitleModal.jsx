@@ -8,6 +8,7 @@ import SegmentedControl from './ui/SegmentedControl';
 const FONT_OPTIONS = [
     { value: 'Anton', label: 'Anton' },
     { value: 'Montserrat ExtraBold', label: 'Montserrat' },
+    { value: 'Noto Sans Devanagari', label: 'Noto Sans Devanagari (Hindi)' },
     { value: 'Verdana', label: 'Verdana' },
     { value: 'Arial', label: 'Arial' },
     { value: 'Impact', label: 'Impact' },

@@ -26,6 +26,7 @@ export const SUBTITLE_FONTS: Record<string, string> = {
   Helvetica: "Helvetica, Arial, sans-serif",
   Georgia: "Georgia, 'Times New Roman', serif",
   "Courier New": "'Courier New', Courier, monospace",
+  "Noto Sans Devanagari": "'Noto Sans Devanagari', 'Noto Sans', sans-serif",
 };
 
 export function getFontStack(fontFamily: string): string {

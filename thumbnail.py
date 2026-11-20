@@ -770,7 +770,7 @@ REQUIREMENTS:
    - Chapter titles should be concise and descriptive
    - Format: 0:00 Chapter Title
    - Place chapters in their own section with a blank line before and after
-5. Add 5-10 relevant hashtags at the end
+5. Add EXACTLY 10 unique, highly relevant hashtags at the end. Count them carefully; do not add more or fewer.
 6. Keep the total description under 5000 characters
 
 OUTPUT: Return ONLY the description text (no JSON wrapper, no markdown code blocks). The description should be ready to paste directly into YouTube."""

@@ -49,15 +49,6 @@ export default function MediaInput({ onProcess, isProcessing }) {
     const [targetClips, setTargetClips] = useState('');
     const [clipMinSeconds, setClipMinSeconds] = useState('');
     const [clipMaxSeconds, setClipMaxSeconds] = useState('');
-    // Auto-hook: burn the AI hook text into every clip. On by default; the
-    // choice persists so turning it off sticks across sessions.
-    const [autoHook, setAutoHook] = useState(() => {
-        try { return localStorage.getItem('os_auto_hook') !== '0'; } catch { return true; }
-    });
-    const [autoHookStyle, setAutoHookStyle] = useState(() => {
-        // v2 key: the default became 'pill'; an old saved 'classic' was just the old default.
-        try { return localStorage.getItem('os_auto_hook_style_v2') || 'pill'; } catch { return 'pill'; }
-    });
     // Layout: 'auto' lets the AI pick per video (server default); the others
     // force one on so a podcast host who knows what they uploaded doesn't
     // depend on the detector, and 'none' keeps the plain single crop.
@@ -124,15 +115,11 @@ export default function MediaInput({ onProcess, isProcessing }) {
             targetClips: targetClips || null,
             clipMinSeconds: clipMinSeconds || null,
             clipMaxSeconds: clipMaxSeconds || null,
-            autoHook,
-            autoHookStyle,
             layout,
             sourceStart: range ? Math.round(range.start) : null,
             sourceEnd: range ? Math.round(range.end) : null,
         };
         try {
-            localStorage.setItem('os_auto_hook', autoHook ? '1' : '0');
-            localStorage.setItem('os_auto_hook_style_v2', autoHookStyle);
             localStorage.setItem('os_layout', layout);
         } catch { /* ignore */ }
         if (mode === 'url' && url) {
@@ -253,7 +240,7 @@ export default function MediaInput({ onProcess, isProcessing }) {
                                 />
                                 <Upload className="mx-auto mb-3 text-muted" size={18} />
                                 <p className="text-ink2 lowercase">Click to upload or drag and drop</p>
-                                <p className="readout mt-2">MP4, MOV up to 500MB · at least {MIN_SOURCE_SECONDS}s long</p>
+                                <p className="readout mt-2">MP4, MOV up to 10GB · at least {MIN_SOURCE_SECONDS}s long</p>
                             </label>
                         )}
                     </div>
@@ -312,7 +299,7 @@ export default function MediaInput({ onProcess, isProcessing }) {
                     >
                         <ChevronDown size={14} className={`transition-transform ${showAdvanced ? 'rotate-180' : ''}`} />
                         advanced options
-                        {(targetClips || clipMinSeconds || clipMaxSeconds || !autoHook) && (
+                        {(targetClips || clipMinSeconds || clipMaxSeconds) && (
                             <span className="text-brass">·</span>
                         )}
                     </button>
@@ -354,53 +341,7 @@ export default function MediaInput({ onProcess, isProcessing }) {
                                 Targets, not guarantees: the AI returns fewer clips when the
                                 material doesn't hold them. Leave blank to let it decide.
                             </p>
-                            <div className="col-span-1 sm:col-span-3 flex flex-wrap items-center justify-between gap-3 pt-3 sm:pt-1 border-t border-rule">
-                                <span className="text-xs text-ink2">vertical layout</span>
-                                <select
-                                    value={layout}
-                                    onChange={(e) => setLayout(e.target.value)}
-                                    className="input-field !w-auto text-xs py-1.5"
-                                    aria-label="vertical layout"
-                                >
-                                    <option value="auto">Auto (AI picks per video)</option>
-                                    <option value="split">Two speakers stacked</option>
-                                    <option value="screencast">Screen over presenter</option>
-                                    <option value="none">Single crop only</option>
-                                </select>
-                            </div>
-                            <div className="col-span-1 sm:col-span-3 flex flex-wrap items-center justify-between gap-3 pt-3 sm:pt-1 border-t border-rule">
-                                <label className="flex items-center gap-2 text-xs text-ink2 cursor-pointer select-none">
-                                    <input
-                                        type="checkbox"
-                                        checked={autoHook}
-                                        onChange={(e) => setAutoHook(e.target.checked)}
-                                        className="w-4 h-4 shrink-0 accent-[var(--color-accent)] cursor-pointer"
-                                    />
-                                    auto hook titles on clips
-                                </label>
-                                {autoHook && (
-                                    <select
-                                        value={autoHookStyle}
-                                        onChange={(e) => setAutoHookStyle(e.target.value)}
-                                        className="input-field !w-auto text-xs py-1.5"
-                                    >
-                                        <option value="pill">Pills</option>
-                                        <option value="classic">Classic</option>
-                                        <option value="dark">Dark</option>
-                                        <option value="yellow">Yellow</option>
-                                        <option value="red">Red</option>
-                                        <option value="outline">Outline</option>
-                                        <option value="outline_yellow">Outline+</option>
-                                    </select>
-                                )}
-                                {autoHook && (
-                                    <p className="w-full text-[11px] leading-relaxed text-muted">
-                                        You can change each clip&apos;s hook text, style, position and size
-                                        afterwards with its hook button.
-                                    </p>
-                                )}
-                            </div>
-                        </div>
+                                                                                </div>
                     )}
                 </div>
 

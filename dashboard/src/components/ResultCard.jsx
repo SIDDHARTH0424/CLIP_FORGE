@@ -148,7 +148,15 @@ export default function ResultCard({ clip, index, jobId, durable, uploadPostKey,
             const a = document.createElement('a');
             a.style.display = 'none';
             a.href = url;
-            a.download = `clip-${index + 1}.mp4`;
+            const rawTitle = clip.video_title_for_youtube_short || `clip-${index + 1}`;
+            const safeTitle = String(rawTitle).normalize('NFC')
+                .replace(/[<>:"/\\|?*\u0000-\u001F]/g, ' ')
+                .replace(/\s+/g, ' ')
+                .replace(/[. ]+$/g, '')
+                .trim()
+                .slice(0, 150)
+                .replace(/[. ]+$/g, '');
+            a.download = `${safeTitle || `clip-${index + 1}`}.mp4`;
             document.body.appendChild(a);
             a.click();
             window.URL.revokeObjectURL(url);

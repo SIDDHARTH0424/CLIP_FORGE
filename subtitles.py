@@ -149,6 +149,40 @@ def generate_srt_from_video(video_path, output_path, max_chars=20, max_duration=
     return generate_srt(transcript, 0, duration, output_path, max_chars, max_duration)
 
 
+_HINGLISH_IMPORT_WARNED = False
+
+
+def _romanize_hindi_word(value):
+    """Convert Devanagari Hindi text to plain Roman-script Hinglish.
+
+    English words and text without Devanagari characters are left untouched.
+    This is transliteration, not translation.
+    """
+    global _HINGLISH_IMPORT_WARNED
+
+    value = str(value or "")
+    if not re.search(r"[\u0900-\u097f]", value):
+        return value
+
+    try:
+        from indic_transliteration import sanscript
+        from indic_transliteration.sanscript import transliterate
+
+        # Lowercase ITRANS output for familiar, plain-text Hinglish spelling.
+        return transliterate(
+            value, sanscript.DEVANAGARI, sanscript.ITRANS
+        ).lower()
+
+    except ImportError:
+        if not _HINGLISH_IMPORT_WARNED:
+            _log(
+                "⚠️ Hindi-to-Hinglish dependency is unavailable; "
+                "keeping the original Devanagari captions."
+            )
+            _HINGLISH_IMPORT_WARNED = True
+        return value
+
+
 def _collect_word_blocks(transcript, clip_start, clip_end, max_chars=20, max_duration=2.0):
     """
     Flatten transcript words for a clip range and group them into short blocks
@@ -164,10 +198,19 @@ def _collect_word_blocks(transcript, clip_start, clip_end, max_chars=20, max_dur
         flat_words.extend(segment.get('words', []))
     flat_words = merge_continuation_words(flat_words)
 
+    # Only romanize Hindi ASR transcripts. Synthetic transcripts created from
+    # manually edited caption words are explicitly protected.
+    language = str(transcript.get("language", "en") or "en").lower().replace("_", "-")
+    is_hindi = language in ("hi", "hin") or language.startswith("hi-")
+    romanize_hindi = is_hindi and not transcript.get("_preserve_word_text", False)
+
     words = []
     for word_info in flat_words:
         if word_info.get('end', 0) > clip_start and word_info.get('start', 0) < clip_end:
-            cleaned_word = _normalize_subtitle_word(word_info.get('word', ''))
+            raw_word = word_info.get('word', '')
+            if romanize_hindi:
+                raw_word = _romanize_hindi_word(raw_word)
+            cleaned_word = _normalize_subtitle_word(raw_word)
             if not cleaned_word:
                 continue
             words.append({
